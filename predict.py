@@ -38,14 +38,13 @@ class Pytorch_model:
 
     def predict(self, img: str, short_size: int = 736, min_area: int = 100):
         '''
-        对传入的图像进行预测，支持图像地址, opencv读取图片，偏慢
-        :param img: 图像地址
-        :param short_size: 
-        :param min_area: 小于该尺度的bbox忽略
-        :return:
+        Predict the input image and return contours and bounding boxes.
+        :param img: Image path
+        :param short_size: Resize short side
+        :param min_area: Ignore bbox smaller than this area
+        :return: Dilated polygons, bounding boxes, and time taken
         '''
-        # print(img)
-        assert os.path.exists(img), 'file is not exists'
+        assert os.path.exists(img), 'file does not exist'
         img = cv2.imread(img)
         if self.img_channel == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -54,37 +53,38 @@ class Pytorch_model:
         img = cv2.resize(img, None, fx=scale, fy=scale)
 
         tensor = transforms.ToTensor()(img)
-        tensor = tensor.unsqueeze_(0)
+        tensor = tensor.unsqueeze_(0).to(self.device)
 
-        tensor = tensor.to(self.device)
         with torch.no_grad():
-            torch.cuda.synchronize(self.device)
+            # Only synchronize if a CUDA device is available
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
             start = time.time()
             preds = self.net(tensor)[0]
-            torch.cuda.synchronize(self.device)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
             scale = (preds.shape[2] / w, preds.shape[1] / h)
             t = time.time() - start
-            
+
         '''inference'''
         start = time.time()
         prob_map, thres_map = preds[0], preds[1]
         
-        ## Step 1: Use threshold to get the binary map 
+        # Step 1: Threshold to get binary map 
         thr = 0.2
         out = (prob_map > thr).float() * 255
         out = out.data.cpu().numpy().astype(np.uint8)
-        # cv2.imwrite('c_bin_map.png', out)   
-        
-        ## Step 2: Connected components findContours
+
+        # Step 2: Find contours
         contours, hierarchy = cv2.findContours(out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = [(i / scale).astype(np.int) for i in contours if len(i)>=4] 
+        contours = [(i / scale).astype(np.int) for i in contours if len(i) >= 4] 
                 
-        # Step 3: Dilate the shrunk region (not necessary)    
+        # Step 3: Dilate the region (not necessary)    
         ratio_prime = 1.5
         dilated_polys = []
         for poly in contours:
-            poly = poly[:,0,:]
-            D_prime = cv2.contourArea(poly) * ratio_prime / cv2.arcLength(poly, True) # formula(10) in the thesis
+            poly = poly[:, 0, :]
+            D_prime = cv2.contourArea(poly) * ratio_prime / cv2.arcLength(poly, True)  # Formula from thesis
             pco = pyclipper.PyclipperOffset()
             pco.AddPath(poly, pyclipper.JT_ROUND, pyclipper.ET_CLOSEDPOLYGON)
             dilated_poly = np.array(pco.Execute(D_prime))
@@ -94,9 +94,6 @@ class Pytorch_model:
             
         boxes_list = []
         for cnt in dilated_polys:
-            # print('=============')
-            # print(cnt)
-            # print(len(cnt))
             if cv2.contourArea(cnt) < min_area:
                 continue
             rect = cv2.minAreaRect(cnt)
